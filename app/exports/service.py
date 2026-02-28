@@ -3,80 +3,50 @@ import csv
 import uuid
 import logging
 from datetime import datetime
-from sqlalchemy import select, func
+from sqlalchemy import select
 from sqlalchemy.orm import Session
+
 from app.models import User, Watermark
+from app.database import SessionLocal
 
 logger = logging.getLogger(__name__)
 
 
-# ----------------------------
-# PUBLIC ENTRY FUNCTION
-# ----------------------------
+# ============================
+# MAIN EXPORT RUNNER
+# ============================
 
-def run_export(session: Session, consumer_id: str, export_type: str, output_dir: str):
-    """
-    Main export runner.
-    Handles:
-    - full
-    - incremental
-    - delta
-    """
+def run_export(consumer_id: str, export_type: str, output_dir: str):
 
-    job_id = str(uuid.uuid4())
-    start_time = datetime.utcnow()
-
-    filename = f"{export_type}_{consumer_id}_{int(start_time.timestamp())}.csv"
-    filepath = os.path.join(output_dir, filename)
-
-    logger.info("Export job started", extra={
-        "jobId": job_id,
-        "consumerId": consumer_id,
-        "exportType": export_type
-    })
+    db = SessionLocal()
 
     try:
-        with session.begin():
+        with db.begin():
 
-            # 1️⃣ Fetch data
-            rows = fetch_rows(session, consumer_id, export_type)
+            rows = fetch_rows(db, consumer_id, export_type)
 
-            # 2️⃣ Write CSV
+            filename = f"{export_type}_{consumer_id}_{int(datetime.utcnow().timestamp())}.csv"
+            filepath = os.path.join(output_dir, filename)
+
             if export_type == "delta":
                 write_delta_csv(rows, filepath)
             else:
                 write_standard_csv(rows, filepath)
 
-            # 3️⃣ Update watermark ONLY after successful write
             if rows:
-                max_timestamp = max(row.updated_at for row in rows)
-                upsert_watermark(session, consumer_id, max_timestamp)
+                max_ts = max(r.updated_at for r in rows)
+                upsert_watermark(db, consumer_id, max_ts)
 
-        duration = (datetime.utcnow() - start_time).total_seconds()
-
-        logger.info("Export job completed", extra={
-            "jobId": job_id,
-            "rowsExported": len(rows),
-            "durationSeconds": duration
-        })
-
-        return {
-            "jobId": job_id,
-            "status": "completed",
-            "outputFilename": filename
-        }
+        print(f"Export completed for {consumer_id}")
 
     except Exception as e:
-        logger.error("Export job failed", extra={
-            "jobId": job_id,
-            "error": str(e)
-        })
-        raise
+        print("EXPORT ERROR:", e)
 
-
-# ----------------------------
+    finally:
+        db.close()
+# ============================
 # FETCH LOGIC
-# ----------------------------
+# ============================
 
 def fetch_rows(session: Session, consumer_id: str, export_type: str):
 
@@ -90,7 +60,7 @@ def fetch_rows(session: Session, consumer_id: str, export_type: str):
     if watermark:
         condition = User.updated_at > watermark.last_exported_at
     else:
-        condition = True  # No watermark yet → full snapshot
+        condition = True  # No watermark → full snapshot
 
     if export_type == "incremental":
         return session.scalars(
@@ -109,9 +79,9 @@ def fetch_rows(session: Session, consumer_id: str, export_type: str):
         raise ValueError("Invalid export type")
 
 
-# ----------------------------
+# ============================
 # CSV WRITERS
-# ----------------------------
+# ============================
 
 def write_standard_csv(rows, filepath):
 
@@ -154,10 +124,8 @@ def write_delta_csv(rows, filepath):
         ])
 
         for row in rows:
-            operation = determine_operation(row)
-
             writer.writerow([
-                operation,
+                determine_operation(row),
                 row.id,
                 row.name,
                 row.email,
@@ -167,9 +135,9 @@ def write_delta_csv(rows, filepath):
             ])
 
 
-# ----------------------------
+# ============================
 # DELTA OPERATION LOGIC
-# ----------------------------
+# ============================
 
 def determine_operation(user):
 
@@ -181,9 +149,9 @@ def determine_operation(user):
         return "UPDATE"
 
 
-# ----------------------------
+# ============================
 # WATERMARK MANAGEMENT
-# ----------------------------
+# ============================
 
 def get_watermark(session: Session, consumer_id: str):
     return session.scalar(
@@ -199,9 +167,10 @@ def upsert_watermark(session: Session, consumer_id: str, last_exported_at):
         existing.last_exported_at = last_exported_at
         existing.updated_at = datetime.utcnow()
     else:
-        new_watermark = Watermark(
-            consumer_id=consumer_id,
-            last_exported_at=last_exported_at,
-            updated_at=datetime.utcnow()
+        session.add(
+            Watermark(
+                consumer_id=consumer_id,
+                last_exported_at=last_exported_at,
+                updated_at=datetime.utcnow()
+            )
         )
-        session.add(new_watermark)
